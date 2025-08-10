@@ -1,6 +1,6 @@
 {
-  "name": "tokyo-live-proxy-rewrite",
-  "version": "1.2.0",
+  "name": "tokyo-live-proxy-rewrite-https",
+  "version": "1.3.0",
   "private": true,
   "main": "server.js",
   "scripts": {
