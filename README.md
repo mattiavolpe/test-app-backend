@@ -1,13 +1,10 @@
-# Proxy (HLS rewrite + HTTPS + iframe fetch)
+# Proxy (HLS rewrite + HTTPS + iframe + gethls)
 Endpoints
 - `/health` -> ok
-- `/proxy?url=<m3u8>` -> HLS con riscrittura dei manifest (pass-through segmenti)
-- `/iframe?url=<page>` -> scarica HTML, rimuove X-Frame-Options/CSP, inietta <base> (best-effort)
+- `/proxy?url=<m3u8>` -> HLS con riscrittura manifest
+- `/iframe?url=<page>` -> proxied HTML (best-effort)
+- `/gethls?url=<page>` -> estrae il primo URL `.m3u8` trovato nella pagina e lo restituisce in JSON
 
-Railway
-- Porta: usa quella suggerita (es. 8080)
-- Start: `npm start` o Procfile
-
-Nota
-- L'endpoint /iframe è "best effort": alcuni siti potrebbero avere protezioni JS ulteriori.
-- Usa fonti autorizzate quando possibile.
+Note
+- `gethls` usa regex generiche per trovare `.m3u8` in HTML/JS e normalizza URL relativi.
+- Non tutte le pagine espongono HLS pubblico; alcune usano player proprietari/token.

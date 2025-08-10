@@ -1,5 +1,5 @@
 
-// server.js — Proxy with HLS manifest rewriting + HTTPS awareness + iframe fetcher
+// server.js — Proxy with HLS rewrite + HTTPS + iframe fetch + generic gethls extractor
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const cors = require('cors');
@@ -8,7 +8,6 @@ const fetch = require('node-fetch');
 const app = express();
 app.set('trust proxy', true);
 
-// CORS
 app.use(cors({
   origin: '*',
   methods: ['GET', 'HEAD', 'OPTIONS'],
@@ -19,7 +18,7 @@ app.options('*', cors());
 app.get('/', (_req, res) => res.status(200).send('ok'));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
-// Helpers for HLS
+// Helpers
 function toAbsolute(baseUrl, maybeRelative) {
   try { return new URL(maybeRelative).href; }
   catch {
@@ -41,7 +40,7 @@ function rewriteManifest(originalUrl, body, proxyBase) {
   return out.join('\n');
 }
 
-// HLS proxy with manifest rewriting
+// /proxy — HLS with manifest rewriting
 app.use('/proxy', (req, res, next) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('missing url');
@@ -72,11 +71,9 @@ app.use('/proxy', (req, res, next) => {
                           || ct.includes('application/x-mpegurl')
                           || (req.query.url || '').toLowerCase().includes('.m3u8');
 
-          // Copy headers except content-length
           Object.keys(proxyRes.headers).forEach(h => {
             if (h.toLowerCase() !== 'content-length') res2.setHeader(h, proxyRes.headers[h]);
           });
-          // CORS
           res2.setHeader('Access-Control-Allow-Origin', '*');
           res2.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Range');
           res2.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS');
@@ -103,7 +100,7 @@ app.use('/proxy', (req, res, next) => {
   })(req, res, next);
 });
 
-// Iframe fetcher: fetch HTML and strip XFO/CSP; inject <base> for relative URLs
+// /iframe — best-effort HTML proxy
 app.get('/iframe', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('missing url');
@@ -111,25 +108,65 @@ app.get('/iframe', async (req, res) => {
   try {
     const r = await fetch(targetUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     const html = await r.text();
-
-    // Inject <base> into <head> and remove X-Frame-Options/CSP by not forwarding them
     const u = new URL(targetUrl);
     let patched = html;
-
-    // naive <head> injection
     if (/<head[^>]*>/i.test(patched)) {
       patched = patched.replace(/<head[^>]*>/i, match => `${match}\n<base href="${u.origin}/">`);
     } else {
       patched = `<head><base href="${u.origin}/"></head>${patched}`;
     }
-
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
-    // No X-Frame-Options / CSP headers set here
     res.status(200).send(patched);
   } catch (e) {
     console.error('iframe fetch error:', e);
     res.status(502).send('iframe proxy error');
+  }
+});
+
+// /gethls — extract first .m3u8 from any page (Skyline, Webcamtaxi, etc.)
+app.get('/gethls', async (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl) return res.status(400).json({ error: 'missing url' });
+  try {
+    const r = await fetch(targetUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const html = await r.text();
+
+    // simple regexes to find .m3u8 in HTML/JS
+    const patterns = [
+      /https?:\/\/[^\s'"]+\.m3u8[^\s'"]*/gi,
+      /['"]([^'"]+\.m3u8[^'"]*)['"]/gi
+    ];
+    let found = null;
+    for (const p of patterns) {
+      const m = html.match(p);
+      if (m && m.length) { found = m[0].replace(/^['"]|['"]$/g, ''); break; }
+    }
+
+    // also try to capture relative URLs in <source> or JS arrays
+    if (!found) {
+      const relPattern = /(?:src|file)\s*[:=]\s*['"]([^'"]+\.m3u8[^'"]*)['"]/gi;
+      const m = relPattern.exec(html);
+      if (m && m[1]) { found = m[1]; }
+    }
+
+    if (!found) return res.status(404).json({ error: 'no m3u8 found' });
+
+    // normalize to absolute
+    let abs = found;
+    try { new URL(abs); } catch {
+      const base = new URL(targetUrl);
+      if (abs.startsWith('/')) abs = base.origin + abs;
+      else {
+        const pathname = base.pathname.endsWith('/') ? base.pathname : base.pathname.substring(0, base.pathname.lastIndexOf('/') + 1);
+        abs = base.origin + pathname + abs;
+      }
+    }
+
+    return res.json({ url: abs });
+  } catch (e) {
+    console.error('gethls error:', e);
+    res.status(502).json({ error: 'gethls error' });
   }
 });
 
