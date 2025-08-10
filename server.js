@@ -1,4 +1,4 @@
-// server.js — Proxy v1.9: stronger getyoutube + richer headers
+// server.js — Proxy v1.9.1: fix regex literals (use RegExp constructors), robust YouTube/HLS extraction
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const cors = require('cors');
@@ -36,7 +36,7 @@ function rewriteManifest(originalUrl, body, proxyBase) {
     const proxied = `${proxyBase}/proxy?url=${encodeURIComponent(absolute)}`;
     return proxied;
   });
-  return out.join('\\n');
+  return out.join('\n');
 }
 
 const commonHeaders = (targetUrl)=>{
@@ -98,7 +98,7 @@ app.get('/iframe', async (req,res)=>{
     const html = await r.text();
     const u = new URL(targetUrl);
     let patched = html;
-    if (/<head[^>]*>/i.test(patched)) patched = patched.replace(/<head[^>]*>/i, m => `${m}\\n<base href="${u.origin}/">`);
+    if (/<head[^>]*>/i.test(patched)) patched = patched.replace(/<head[^>]*>/i, m => `${m}\n<base href="${u.origin}/">`);
     else patched = `<head><base href="${u.origin}/"></head>${patched}`;
     res.setHeader('Content-Type','text/html; charset=utf-8');
     res.setHeader('Cache-Control','no-store');
@@ -151,14 +151,15 @@ app.get('/getyoutube', async (req,res)=>{
 });
 
 function extractM3U8(html){
-  const patterns = [
-    /https?:\\/\\/[^\s"'<>]+\\.m3u8[^\s"'<>]*/gi,
-    /['"]([^'"]+\\.m3u8[^'"]*)['"]/gi,
-    /file\\s*:\\s*['"]([^'"]+\\.m3u8[^'"]*)['"]/gi,
-    /source\\s*:\\s*['"]([^'"]+\\.m3u8[^'"]*)['"]/gi,
-    /src\\s*=\\s*['"]([^'"]+\\.m3u8[^'"]*)['"]/gi,
-    /playlist\\s*:\\s*\\[\\s*['"]([^'"]+\\.m3u8[^'"]*)['"]/gi
+  const patternStrings = [
+    String.raw`https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*`,
+    String.raw`['"]([^'"]+\.m3u8[^'"]*)['"]`,
+    String.raw`file\s*:\s*['"]([^'"]+\.m3u8[^'"]*)['"]`,
+    String.raw`source\s*:\s*['"]([^'"]+\.m3u8[^'"]*)['"]`,
+    String.raw`src\s*=\s*['"]([^'"]+\.m3u8[^'"]*)['"]`,
+    String.raw`playlist\s*:\s*\[\s*['"]([^'"]+\.m3u8[^'"]*)['"]`
   ];
+  const patterns = patternStrings.map(p => new RegExp(p, 'gi'));
   for(const p of patterns){
     const m = p.exec(html);
     if(m){ return (m[1]||m[0]).replace(/^['"]|['"]$/g,''); }
@@ -166,65 +167,73 @@ function extractM3U8(html){
   return null;
 }
 
-// more robust YouTube ID picker
 function pickYouTubeId(html){
-  // direct embeds
-  let m = /youtube(?:-nocookie)?\\.com\\/embed\\/([a-zA-Z0-9_-]{11})/i.exec(html);
-  if(m) return m[1];
-  m = /youtu\\.be\\/([a-zA-Z0-9_-]{11})/i.exec(html);
-  if(m) return m[1];
-  // data-* attributes
-  m = /data-(?:src|url|video|embed|youtube|ytid)=[\\"']([^\\\\"']+)[\\"']/i.exec(html);
+  const patternStrings = [
+    String.raw`youtube(?:-nocookie)?\.com\/embed\/([a-zA-Z0-9_-]{11})`,
+    String.raw`youtu\.be\/([a-zA-Z0-9_-]{11})`,
+    String.raw`data-(?:src|url|video|embed|youtube|ytid)=["']([^"']+)["']`,
+    String.raw`["']videoId["']\s*:\s*["']([a-zA-Z0-9_-]{11})["']`,
+    String.raw`<meta[^>]+property=["']og:video:url["'][^>]+content=["']([^"']+)["']`,
+    String.raw`<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>`,
+    String.raw`<iframe[^>]+srcdoc=['"]([\s\S]*?)['"]`,
+    String.raw`(?:youtube\.com\/watch\?[^"'<>]*[?&]v=|[?&]v=)([a-zA-Z0-9_-]{11})`
+  ];
+  const patterns = patternStrings.map(p => new RegExp(p, 'gi'));
+
+  // 1) direct embed
+  let m = patterns[0].exec(html); if(m) return m[1];
+  m = patterns[1].exec(html); if(m) return m[1];
+  // 2) data-* attributes
+  m = patterns[2].exec(html);
   if(m){
     const s = m[1];
-    let idm = /embed\\/([a-zA-Z0-9_-]{11})/.exec(s) || /[?&]v=([a-zA-Z0-9_-]{11})/.exec(s);
-    if(idm) return idm[1];
+    let em = /embed\/([a-zA-Z0-9_-]{11})/.exec(s) || /[?&]v=([a-zA-Z0-9_-]{11})/.exec(s);
+    if(em) return em[1];
   }
-  // JSON "videoId"
-  m = /["']videoId["']\\s*:\\s*["']([a-zA-Z0-9_-]{11})["']/i.exec(html);
-  if(m) return m[1];
-  // meta og:video:url or ld+json
-  m = /<meta[^>]+property=["']og:video:url["'][^>]+content=["']([^"']+)["']/i.exec(html);
+  // 3) JSON "videoId"
+  m = patterns[3].exec(html); if(m) return m[1];
+  // 4) meta og:video:url
+  m = patterns[4].exec(html);
   if(m){
     const s = m[1];
-    let idm = /embed\\/([a-zA-Z0-9_-]{11})/.exec(s) || /[?&]v=([a-zA-Z0-9_-]{11})/.exec(s);
-    if(idm) return idm[1];
+    let em = /embed\/([a-zA-Z0-9_-]{11})/.exec(s) || /[?&]v=([a-zA-Z0-9_-]{11})/.exec(s);
+    if(em) return em[1];
   }
-  const ld = /<script[^>]+type=["']application\\/ld\\+json["'][^>]*>([\\s\\S]*?)<\\/script>/gi;
+  // 5) JSON-LD blocks
   let mld;
-  while((mld = ld.exec(html))){
+  while((mld = patterns[5].exec(html))){
     try{
       const data = JSON.parse(mld[1]);
       const items = Array.isArray(data) ? data : [data];
       for(const it of items){
         const emb = (it && (it.embedUrl || (it.video && it.video.embedUrl)));
         if(typeof emb === 'string'){
-          let idm = /embed\\/([a-zA-Z0-9_-]{11})/.exec(emb) || /[?&]v=([a-zA-Z0-9_-]{11})/.exec(emb);
-          if(idm) return idm[1];
+          let em = /embed\/([a-zA-Z0-9_-]{11})/.exec(emb) || /[?&]v=([a-zA-Z0-9_-]{11})/.exec(emb);
+          if(em) return em[1];
         }
       }
     }catch(_){}
   }
-  // srcdoc content
-  m = /<iframe[^>]+srcdoc=['"]([\\s\\S]*?)['"]/i.exec(html);
+  // 6) srcdoc
+  m = patterns[6].exec(html);
   if(m){
     const inner = m[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'");
-    let idm = /youtube(?:-nocookie)?\\.com\\/embed\\/([a-zA-Z0-9_-]{11})/i.exec(inner) || /[?&]v=([a-zA-Z0-9_-]{11})/i.exec(inner);
-    if(idm) return idm[1];
+    let em = /youtube(?:-nocookie)?\.com\/embed\/([a-zA-Z0-9_-]{11})/i.exec(inner) || /[?&]v=([a-zA-Z0-9_-]{11})/i.exec(inner);
+    if(em) return em[1];
   }
-  // generic links with v=
-  m = /(?:youtube\\.com\\/watch\\?[^"'<>]*[?&]v=|[?&]v=)([a-zA-Z0-9_-]{11})/i.exec(html);
-  if(m) return m[1];
+  // 7) generic v=
+  m = patterns[7].exec(html); if(m) return m[1];
 
   return null;
 }
 
 async function bfsIframeHtmls(baseUrl, html, depth){
+  const toAbs = (u)=>toAbsolute(baseUrl, u);
   const visited = new Set();
   const queue = [];
   const iframes = [...html.matchAll(/<iframe[^>]+src=['"]([^'"]+)['"]/gi)];
   for(const m of iframes){
-    const u = toAbsolute(baseUrl, m[1]);
+    const u = toAbs(m[1]);
     if(!visited.has(u)){ visited.add(u); queue.push({url:u, d:1}); }
   }
   const out = [];

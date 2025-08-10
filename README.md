@@ -1,6 +1,9 @@
-# Proxy v1.9
-- /getyoutube: id YouTube da data-* attrib, srcdoc, og:video, JSON-LD, link v=; BFS su *tutti* gli iframe (3 livelli).
-- /gethls: BFS iframe (2 livelli). Intestazioni fetch più "browser-like" (User-Agent, Referer, Accept-Language).
-- /proxy + /iframe invariati (con header migliorati).
+# Proxy v1.9.1
+Fix: regex in letterali → ora con `new RegExp()` (compatibile anche con Node 22).
+Funzioni:
+- /proxy (riscrive manifest HLS)
+- /iframe (proxy HTML con base)
+- /gethls (BFS su iframe, 2 livelli)
+- /getyoutube (BFS su iframe, 3 livelli; data-*, srcdoc, meta, JSON-LD, v=)
 
-Se un sito mostra 404/403 a bot/serverside fetch, la pagina in iframe può risultare "404". In questi casi conviene staccare l'ID YouTube o usare un HLS pubblico.
+Suggerimento Railway: imposta PORT a 8080 se richiesto in fase di probing.
