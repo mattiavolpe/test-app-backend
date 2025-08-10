@@ -1,4 +1,4 @@
-// server.js — HLS proxy + HTTPS + iframe + improved getyoutube (BFS across iframes) + gethls
+// server.js — Proxy v1.9: stronger getyoutube + richer headers
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const cors = require('cors');
@@ -8,7 +8,8 @@ const app = express();
 app.set('trust proxy', true);
 
 app.use(cors({
-  origin: '*', methods: ['GET','HEAD','OPTIONS'],
+  origin: '*',
+  methods: ['GET','HEAD','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization','Range']
 }));
 app.options('*', cors());
@@ -16,12 +17,11 @@ app.options('*', cors());
 app.get('/', (_req,res)=>res.status(200).send('ok'));
 app.get('/health', (_req,res)=>res.status(200).send('ok'));
 
-// utils
 function toAbsolute(baseUrl, maybeRelative) {
   try { return new URL(maybeRelative).href; }
   catch {
     const base = new URL(baseUrl);
-    if (maybeRelative.startsWith('//')) return base.protocol + maybeRelative; // protocol-relative
+    if (maybeRelative.startsWith('//')) return base.protocol + maybeRelative;
     if (maybeRelative.startsWith('/')) return base.origin + maybeRelative;
     const pathname = base.pathname.endsWith('/') ? base.pathname : base.pathname.substring(0, base.pathname.lastIndexOf('/') + 1);
     return base.origin + pathname + maybeRelative;
@@ -36,8 +36,18 @@ function rewriteManifest(originalUrl, body, proxyBase) {
     const proxied = `${proxyBase}/proxy?url=${encodeURIComponent(absolute)}`;
     return proxied;
   });
-  return out.join('\n');
+  return out.join('\\n');
 }
+
+const commonHeaders = (targetUrl)=>{
+  const u = new URL(targetUrl);
+  return {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9,it;q=0.8,ja;q=0.8',
+    'Referer': u.origin + '/',
+    'Cache-Control': 'no-cache'
+  };
+};
 
 app.use('/proxy', (req, res, next) => {
   const targetUrl = req.query.url;
@@ -48,6 +58,10 @@ app.use('/proxy', (req, res, next) => {
   return createProxyMiddleware({
     target: origin, changeOrigin:true, secure:false, selfHandleResponse:true,
     pathRewrite: (_p,_r) => { const u = new URL(targetUrl); return u.pathname + (u.search||''); },
+    onProxyReq: (proxyReq)=>{
+      const h = commonHeaders(targetUrl);
+      Object.entries(h).forEach(([k,v])=> proxyReq.setHeader(k,v));
+    },
     onProxyRes: async (proxyRes, _req2, res2) => {
       try {
         const chunks = []; proxyRes.on('data', c => chunks.push(c)); proxyRes.on('end', ()=>{
@@ -80,11 +94,11 @@ app.get('/iframe', async (req,res)=>{
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('missing url');
   try{
-    const r = await fetch(targetUrl, { headers:{ 'User-Agent':'Mozilla/5.0' } });
+    const r = await fetch(targetUrl, { headers: commonHeaders(targetUrl) });
     const html = await r.text();
     const u = new URL(targetUrl);
     let patched = html;
-    if (/<head[^>]*>/i.test(patched)) patched = patched.replace(/<head[^>]*>/i, m => `${m}\n<base href="${u.origin}/">`);
+    if (/<head[^>]*>/i.test(patched)) patched = patched.replace(/<head[^>]*>/i, m => `${m}\\n<base href="${u.origin}/">`);
     else patched = `<head><base href="${u.origin}/"></head>${patched}`;
     res.setHeader('Content-Type','text/html; charset=utf-8');
     res.setHeader('Cache-Control','no-store');
@@ -96,13 +110,13 @@ app.get('/gethls', async (req,res)=>{
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).json({ error:'missing url' });
   try{
-    const html = await (await fetch(targetUrl, { headers:{ 'User-Agent':'Mozilla/5.0' } })).text();
+    const html = await (await fetch(targetUrl, { headers: commonHeaders(targetUrl) })).text();
     let found = extractM3U8(html);
     if(!found){
       const htmls = await bfsIframeHtmls(targetUrl, html, 2);
       for(const h of htmls){
         found = extractM3U8(h.html);
-        if(found) { break; }
+        if(found) break;
       }
     }
     if(!found) return res.status(404).json({ error:'no m3u8 found' });
@@ -119,12 +133,12 @@ app.get('/getyoutube', async (req,res)=>{
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).json({ error:'missing url' });
   try{
-    const mainHtml = await (await fetch(targetUrl, { headers:{ 'User-Agent':'Mozilla/5.0' } })).text();
-    let id = pickYouTubeId(targetUrl, mainHtml);
+    const mainHtml = await (await fetch(targetUrl, { headers: commonHeaders(targetUrl) })).text();
+    let id = pickYouTubeId(mainHtml);
     if(!id){
-      const htmls = await bfsIframeHtmls(targetUrl, mainHtml, 3); // explore broader than before
+      const htmls = await bfsIframeHtmls(targetUrl, mainHtml, 3);
       for(const h of htmls){
-        id = pickYouTubeId(h.url, h.html);
+        id = pickYouTubeId(h.html);
         if(id) break;
       }
     }
@@ -136,15 +150,14 @@ app.get('/getyoutube', async (req,res)=>{
   }
 });
 
-// ---- helpers ----
 function extractM3U8(html){
   const patterns = [
-    /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi,
-    /['"]([^'"]+\.m3u8[^'"]*)['"]/gi,
-    /file\s*:\s*['"]([^'"]+\.m3u8[^'"]*)['"]/gi,
-    /source\s*:\s*['"]([^'"]+\.m3u8[^'"]*)['"]/gi,
-    /src\s*=\s*['"]([^'"]+\.m3u8[^'"]*)['"]/gi,
-    /playlist\s*:\s*\[\s*['"]([^'"]+\.m3u8[^'"]*)['"]/gi
+    /https?:\\/\\/[^\s"'<>]+\\.m3u8[^\s"'<>]*/gi,
+    /['"]([^'"]+\\.m3u8[^'"]*)['"]/gi,
+    /file\\s*:\\s*['"]([^'"]+\\.m3u8[^'"]*)['"]/gi,
+    /source\\s*:\\s*['"]([^'"]+\\.m3u8[^'"]*)['"]/gi,
+    /src\\s*=\\s*['"]([^'"]+\\.m3u8[^'"]*)['"]/gi,
+    /playlist\\s*:\\s*\\[\\s*['"]([^'"]+\\.m3u8[^'"]*)['"]/gi
   ];
   for(const p of patterns){
     const m = p.exec(html);
@@ -153,67 +166,62 @@ function extractM3U8(html){
   return null;
 }
 
-function pickYouTubeId(baseUrl, html){
-  // 1) direct embed urls
-  const embed = /youtube(?:-nocookie)?\.com\/embed\/([a-zA-Z0-9_-]{11})/i.exec(html);
-  if(embed) return embed[1];
-  const shorty = /youtu\.be\/([a-zA-Z0-9_-]{11})/i.exec(html);
-  if(shorty) return shorty[1];
-
-  // 2) videoId in JSON
-  const vid1 = /"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"/i.exec(html);
-  if(vid1) return vid1[1];
-  const vid2 = /'videoId'\s*:\s*'([a-zA-Z0-9_-]{11})'/i.exec(html);
-  if(vid2) return vid2[1];
-
-  // 3) og:video:url or ld+json embedUrl
-  const og = /<meta[^>]+property=["']og:video:url["'][^>]+content=["']([^"']+)["']/i.exec(html);
-  if(og){
-    const m = /embed\/([a-zA-Z0-9_-]{11})/.exec(og[1]); if(m) return m[1];
-    const v = /[?&]v=([a-zA-Z0-9_-]{11})/.exec(og[1]); if(v) return v[1];
+// more robust YouTube ID picker
+function pickYouTubeId(html){
+  // direct embeds
+  let m = /youtube(?:-nocookie)?\\.com\\/embed\\/([a-zA-Z0-9_-]{11})/i.exec(html);
+  if(m) return m[1];
+  m = /youtu\\.be\\/([a-zA-Z0-9_-]{11})/i.exec(html);
+  if(m) return m[1];
+  // data-* attributes
+  m = /data-(?:src|url|video|embed|youtube|ytid)=[\\"']([^\\\\"']+)[\\"']/i.exec(html);
+  if(m){
+    const s = m[1];
+    let idm = /embed\\/([a-zA-Z0-9_-]{11})/.exec(s) || /[?&]v=([a-zA-Z0-9_-]{11})/.exec(s);
+    if(idm) return idm[1];
   }
-  const ld = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
-  let mld; 
+  // JSON "videoId"
+  m = /["']videoId["']\\s*:\\s*["']([a-zA-Z0-9_-]{11})["']/i.exec(html);
+  if(m) return m[1];
+  // meta og:video:url or ld+json
+  m = /<meta[^>]+property=["']og:video:url["'][^>]+content=["']([^"']+)["']/i.exec(html);
+  if(m){
+    const s = m[1];
+    let idm = /embed\\/([a-zA-Z0-9_-]{11})/.exec(s) || /[?&]v=([a-zA-Z0-9_-]{11})/.exec(s);
+    if(idm) return idm[1];
+  }
+  const ld = /<script[^>]+type=["']application\\/ld\\+json["'][^>]*>([\\s\\S]*?)<\\/script>/gi;
+  let mld;
   while((mld = ld.exec(html))){
     try{
       const data = JSON.parse(mld[1]);
-      // handle both object and array
       const items = Array.isArray(data) ? data : [data];
       for(const it of items){
-        const emb = it.embedUrl || (it.video && it.video.embedUrl);
+        const emb = (it && (it.embedUrl || (it.video && it.video.embedUrl)));
         if(typeof emb === 'string'){
-          const m = /embed\/([a-zA-Z0-9_-]{11})/.exec(emb); if(m) return m[1];
-          const v = /[?&]v=([a-zA-Z0-9_-]{11})/.exec(emb); if(v) return v[1];
+          let idm = /embed\\/([a-zA-Z0-9_-]{11})/.exec(emb) || /[?&]v=([a-zA-Z0-9_-]{11})/.exec(emb);
+          if(idm) return idm[1];
         }
       }
     }catch(_){}
   }
-
-  // 4) generic links with v= param
-  const vq = /(?:youtube\.com\/watch\?[^"'<>]*[?&]v=|[?&]v=)([a-zA-Z0-9_-]{11})/i.exec(html);
-  if(vq) return vq[1];
-
-  // 5) srcdoc content inside iframes
-  const srcdoc = /<iframe[^>]+srcdoc=['"]([\s\S]*?)['"]/i.exec(html);
-  if(srcdoc){
-    const inner = htmlEntityDecode(srcdoc[1]);
-    const em2 = /youtube(?:-nocookie)?\.com\/embed\/([a-zA-Z0-9_-]{11})/i.exec(inner);
-    if(em2) return em2[1];
-    const v2 = /[?&]v=([a-zA-Z0-9_-]{11})/i.exec(inner);
-    if(v2) return v2[1];
+  // srcdoc content
+  m = /<iframe[^>]+srcdoc=['"]([\\s\\S]*?)['"]/i.exec(html);
+  if(m){
+    const inner = m[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'");
+    let idm = /youtube(?:-nocookie)?\\.com\\/embed\\/([a-zA-Z0-9_-]{11})/i.exec(inner) || /[?&]v=([a-zA-Z0-9_-]{11})/i.exec(inner);
+    if(idm) return idm[1];
   }
+  // generic links with v=
+  m = /(?:youtube\\.com\\/watch\\?[^"'<>]*[?&]v=|[?&]v=)([a-zA-Z0-9_-]{11})/i.exec(html);
+  if(m) return m[1];
 
   return null;
-}
-
-function htmlEntityDecode(s){
-  return s.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'");
 }
 
 async function bfsIframeHtmls(baseUrl, html, depth){
   const visited = new Set();
   const queue = [];
-  // collect ALL iframe srcs, not just the first
   const iframes = [...html.matchAll(/<iframe[^>]+src=['"]([^'"]+)['"]/gi)];
   for(const m of iframes){
     const u = toAbsolute(baseUrl, m[1]);
@@ -223,7 +231,7 @@ async function bfsIframeHtmls(baseUrl, html, depth){
   while(queue.length){
     const node = queue.shift();
     try{
-      const r = await fetch(node.url, { headers:{ 'User-Agent':'Mozilla/5.0' } });
+      const r = await fetch(node.url, { headers: commonHeaders(node.url) });
       const h = await r.text();
       out.push({ url: node.url, html: h });
       if(node.d < depth){

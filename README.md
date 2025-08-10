@@ -1,7 +1,6 @@
-# Proxy v1.8
-- /proxy: HLS con riscrittura manifest
-- /iframe: proxy HTML best-effort
-- /gethls: estrae .m3u8; BFS su tutti gli iframe fino a 2 livelli
-- /getyoutube: estrae ID YouTube; BFS su tutti gli iframe fino a 3 livelli, parsing srcdoc, meta og:video, JSON-LD, link con v=
+# Proxy v1.9
+- /getyoutube: id YouTube da data-* attrib, srcdoc, og:video, JSON-LD, link v=; BFS su *tutti* gli iframe (3 livelli).
+- /gethls: BFS iframe (2 livelli). Intestazioni fetch più "browser-like" (User-Agent, Referer, Accept-Language).
+- /proxy + /iframe invariati (con header migliorati).
 
-Nota: se un video YouTube è bloccato (privato/geo/embargo), l'embed può risultare "non disponibile".
+Se un sito mostra 404/403 a bot/serverside fetch, la pagina in iframe può risultare "404". In questi casi conviene staccare l'ID YouTube o usare un HLS pubblico.
