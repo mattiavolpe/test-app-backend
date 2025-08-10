@@ -1,9 +1,10 @@
-// server.js — Proxy v1.10: getyoutube returns full iframe src (Skyline-style) when available.
+// server.js — Proxy v1.11
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const cors = require('cors');
 const fetch = require('node-fetch');
 
+const VERSION = '1.11.0';
 const app = express();
 app.set('trust proxy', true);
 
@@ -16,6 +17,7 @@ app.options('*', cors());
 
 app.get('/', (_req,res)=>res.status(200).send('ok'));
 app.get('/health', (_req,res)=>res.status(200).send('ok'));
+app.get('/version', (_req,res)=>res.json({ version: VERSION }));
 
 function toAbsolute(baseUrl, maybeRelative) {
   try { return new URL(maybeRelative).href; }
@@ -36,7 +38,7 @@ function rewriteManifest(originalUrl, body, proxyBase) {
     const proxied = `${proxyBase}/proxy?url=${encodeURIComponent(absolute)}`;
     return proxied;
   });
-  return out.join('\\n');
+  return out.join('\n');
 }
 
 const commonHeaders = (targetUrl)=>{
@@ -55,6 +57,7 @@ app.use('/proxy', (req, res, next) => {
   let origin;
   try { origin = new URL(targetUrl).origin; } catch { return res.status(400).send('bad url'); }
   const proxyBase = `${req.protocol}://${req.get('host')}`;
+  console.log('[proxy] →', targetUrl);
   return createProxyMiddleware({
     target: origin, changeOrigin:true, secure:false, selfHandleResponse:true,
     pathRewrite: (_p,_r) => { const u = new URL(targetUrl); return u.pathname + (u.search||''); },
@@ -78,6 +81,7 @@ app.use('/proxy', (req, res, next) => {
             const out = Buffer.from(rewritten,'utf8');
             res2.setHeader('content-type','application/vnd.apple.mpegurl');
             res2.setHeader('content-length', out.length);
+            console.log('[proxy] manifest rewritten OK');
             return res2.status(proxyRes.statusCode||200).end(out);
           } else {
             res2.status(proxyRes.statusCode||200); return res2.end(buf);
@@ -93,12 +97,13 @@ app.use('/proxy', (req, res, next) => {
 app.get('/iframe', async (req,res)=>{
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('missing url');
+  console.log('[iframe] →', targetUrl);
   try{
     const r = await fetch(targetUrl, { headers: commonHeaders(targetUrl) });
     const html = await r.text();
     const u = new URL(targetUrl);
     let patched = html;
-    if (/<head[^>]*>/i.test(patched)) patched = patched.replace(/<head[^>]*>/i, m => `${m}\\n<base href="${u.origin}/">`);
+    if (/<head[^>]*>/i.test(patched)) patched = patched.replace(/<head[^>]*>/i, m => `${m}\n<base href="${u.origin}/">`);
     else patched = `<head><base href="${u.origin}/"></head>${patched}`;
     res.setHeader('Content-Type','text/html; charset=utf-8');
     res.setHeader('Cache-Control','no-store');
@@ -106,9 +111,10 @@ app.get('/iframe', async (req,res)=>{
   }catch(e){ console.error('iframe error',e); res.status(502).send('iframe proxy error'); }
 });
 
-app.get('/gethls', async (req,res)=>{
+app.get(['/gethls','/api/gethls'], async (req,res)=>{
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).json({ error:'missing url' });
+  console.log('[gethls] →', targetUrl);
   try{
     const html = await (await fetch(targetUrl, { headers: commonHeaders(targetUrl) })).text();
     let found = extractM3U8(html);
@@ -119,9 +125,10 @@ app.get('/gethls', async (req,res)=>{
         if(found) break;
       }
     }
-    if(!found) return res.status(404).json({ error:'no m3u8 found' });
+    if(!found) { console.log('[gethls] none'); return res.status(404).json({ error:'no m3u8 found' }); }
     let absUrl = found;
     try { new URL(absUrl); } catch { absUrl = toAbsolute(targetUrl, absUrl); }
+    console.log('[gethls] OK', absUrl);
     return res.json({ url: absUrl });
   }catch(e){
     console.error('gethls error', e);
@@ -129,20 +136,21 @@ app.get('/gethls', async (req,res)=>{
   }
 });
 
-app.get('/getyoutube', async (req,res)=>{
+app.get(['/getyoutube','/api/getyoutube'], async (req,res)=>{
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).json({ error:'missing url' });
+  console.log('[getyoutube] →', targetUrl);
   try{
     const mainHtml = await (await fetch(targetUrl, { headers: commonHeaders(targetUrl) })).text();
-    // 1) Skyline-style direct iframe (id="live" or class includes "embed-responsive-item")
+    // Skyline-style direct iframe
     const iframeMatch = /<iframe[^>]+(?:id=["']live["'][^>]*|class=["'][^"']*embed-responsive-item[^"']*["'])[^>]*src=["']([^"']+)["'][^>]*>/i.exec(mainHtml);
     if(iframeMatch){
       const full = toAbsolute(targetUrl, iframeMatch[1]);
-      // try to extract id from full URL too
       const idMatch = /\/embed\/([a-zA-Z0-9_-]{11})/.exec(full) || /[?&]v=([a-zA-Z0-9_-]{11})/.exec(full);
-      return res.json({ id: idMatch ? idMatch[1] : undefined, fullUrl: full });
+      console.log('[getyoutube] skyline-direct', full);
+      return res.json({ id: idMatch ? idMatch[1] : undefined, fullUrl: full, source: 'skyline-direct' });
     }
-    // 2) Fallback: previous robust methods (BFS iframes + patterns)
+    // Fallback: previous robust methods
     let id = pickYouTubeId(mainHtml);
     if(!id){
       const htmls = await bfsIframeHtmls(targetUrl, mainHtml, 3);
@@ -151,8 +159,9 @@ app.get('/getyoutube', async (req,res)=>{
         if(id) break;
       }
     }
-    if(!id) return res.status(404).json({ error:'no youtube id found' });
-    return res.json({ id });
+    if(!id) { console.log('[getyoutube] none'); return res.status(404).json({ error:'no youtube id found' }); }
+    console.log('[getyoutube] id', id);
+    return res.json({ id, source: 'fallback' });
   }catch(e){
     console.error('getyoutube error', e);
     res.status(502).json({ error:'getyoutube error' });
@@ -259,4 +268,4 @@ async function bfsIframeHtmls(baseUrl, html, depth){
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT,'0.0.0.0',()=>console.log('Proxy listening on',PORT));
+app.listen(PORT,'0.0.0.0',()=>console.log('Proxy listening on',PORT, 'v'+VERSION));
