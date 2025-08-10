@@ -1,4 +1,4 @@
-// server.js — HLS proxy + HTTPS + iframe + improved gethls (one-level iframe follow)
+// server.js — HLS proxy + HTTPS + iframe + gethls + getyoutube
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const cors = require('cors');
@@ -14,9 +14,11 @@ app.use(cors({
 }));
 app.options('*', cors());
 
+// health
 app.get('/', (_req,res)=>res.status(200).send('ok'));
 app.get('/health', (_req,res)=>res.status(200).send('ok'));
 
+// helpers
 function toAbsolute(baseUrl, maybeRelative) {
   try { return new URL(maybeRelative).href; }
   catch {
@@ -38,6 +40,7 @@ function rewriteManifest(originalUrl, body, proxyBase) {
   return out.join('\n');
 }
 
+// /proxy — HLS with manifest rewriting
 app.use('/proxy', (req, res, next) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('missing url');
@@ -75,6 +78,7 @@ app.use('/proxy', (req, res, next) => {
   })(req,res,next);
 });
 
+// /iframe — best-effort HTML proxy
 app.get('/iframe', async (req,res)=>{
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('missing url');
@@ -91,6 +95,7 @@ app.get('/iframe', async (req,res)=>{
   }catch(e){ console.error('iframe error',e); res.status(502).send('iframe proxy error'); }
 });
 
+// /gethls — extract .m3u8 (follows iframes up to 2 levels)
 app.get('/gethls', async (req,res)=>{
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).json({ error:'missing url' });
@@ -123,6 +128,38 @@ app.get('/gethls', async (req,res)=>{
   }
 });
 
+// /getyoutube — extract YouTube video ID from page (follows iframes up to 2 levels)
+app.get('/getyoutube', async (req,res)=>{
+  const targetUrl = req.query.url;
+  if (!targetUrl) return res.status(400).json({ error:'missing url' });
+  try{
+    const html = await (await fetch(targetUrl, { headers:{ 'User-Agent':'Mozilla/5.0' } })).text();
+    let id = extractYouTubeId(html);
+    if(!id){
+      const ifr = findFirstIframeSrc(html);
+      if(ifr){
+        const abs = toAbsolute(targetUrl, ifr);
+        const html2 = await (await fetch(abs, { headers:{ 'User-Agent':'Mozilla/5.0' } })).text();
+        id = extractYouTubeId(html2);
+        if(!id){
+          const ifr2 = findFirstIframeSrc(html2);
+          if(ifr2){
+            const abs2 = toAbsolute(abs, ifr2);
+            const html3 = await (await fetch(abs2, { headers:{ 'User-Agent':'Mozilla/5.0' } })).text();
+            id = extractYouTubeId(html3);
+          }
+        }
+      }
+    }
+    if(!id) return res.status(404).json({ error:'no youtube id found' });
+    return res.json({ id });
+  }catch(e){
+    console.error('getyoutube error', e);
+    res.status(502).json({ error:'getyoutube error' });
+  }
+});
+
+// helpers
 function extractM3U8(html, base){
   const patterns = [
     /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi,
@@ -141,6 +178,20 @@ function extractM3U8(html, base){
 function findFirstIframeSrc(html){
   const m = /<iframe[^>]+src=['"]([^'"]+)['"]/i.exec(html);
   return m ? m[1] : null;
+}
+function extractYouTubeId(html){
+  // common patterns: youtube.com/embed/ID, youtube-nocookie.com/embed/ID, youtu.be/ID, "videoId":"ID"
+  const patterns = [
+    /youtube(?:-nocookie)?\.com\/embed\/([a-zA-Z0-9_-]{11})/i,
+    /youtu\.be\/([a-zA-Z0-9_-]{11})/i,
+    /"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"/i,
+    /"ytInitialPlayerResponse"[^>]*"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"/i
+  ];
+  for(const p of patterns){
+    const m = p.exec(html);
+    if(m) return m[1];
+  }
+  return null;
 }
 
 const PORT = process.env.PORT || 3000;
