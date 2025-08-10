@@ -1,4 +1,4 @@
-// server.js — Proxy v1.9.1: fix regex literals (use RegExp constructors), robust YouTube/HLS extraction
+// server.js — Proxy v1.10: getyoutube returns full iframe src (Skyline-style) when available.
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const cors = require('cors');
@@ -36,7 +36,7 @@ function rewriteManifest(originalUrl, body, proxyBase) {
     const proxied = `${proxyBase}/proxy?url=${encodeURIComponent(absolute)}`;
     return proxied;
   });
-  return out.join('\n');
+  return out.join('\\n');
 }
 
 const commonHeaders = (targetUrl)=>{
@@ -98,7 +98,7 @@ app.get('/iframe', async (req,res)=>{
     const html = await r.text();
     const u = new URL(targetUrl);
     let patched = html;
-    if (/<head[^>]*>/i.test(patched)) patched = patched.replace(/<head[^>]*>/i, m => `${m}\n<base href="${u.origin}/">`);
+    if (/<head[^>]*>/i.test(patched)) patched = patched.replace(/<head[^>]*>/i, m => `${m}\\n<base href="${u.origin}/">`);
     else patched = `<head><base href="${u.origin}/"></head>${patched}`;
     res.setHeader('Content-Type','text/html; charset=utf-8');
     res.setHeader('Cache-Control','no-store');
@@ -134,6 +134,15 @@ app.get('/getyoutube', async (req,res)=>{
   if (!targetUrl) return res.status(400).json({ error:'missing url' });
   try{
     const mainHtml = await (await fetch(targetUrl, { headers: commonHeaders(targetUrl) })).text();
+    // 1) Skyline-style direct iframe (id="live" or class includes "embed-responsive-item")
+    const iframeMatch = /<iframe[^>]+(?:id=["']live["'][^>]*|class=["'][^"']*embed-responsive-item[^"']*["'])[^>]*src=["']([^"']+)["'][^>]*>/i.exec(mainHtml);
+    if(iframeMatch){
+      const full = toAbsolute(targetUrl, iframeMatch[1]);
+      // try to extract id from full URL too
+      const idMatch = /\/embed\/([a-zA-Z0-9_-]{11})/.exec(full) || /[?&]v=([a-zA-Z0-9_-]{11})/.exec(full);
+      return res.json({ id: idMatch ? idMatch[1] : undefined, fullUrl: full });
+    }
+    // 2) Fallback: previous robust methods (BFS iframes + patterns)
     let id = pickYouTubeId(mainHtml);
     if(!id){
       const htmls = await bfsIframeHtmls(targetUrl, mainHtml, 3);
@@ -180,26 +189,21 @@ function pickYouTubeId(html){
   ];
   const patterns = patternStrings.map(p => new RegExp(p, 'gi'));
 
-  // 1) direct embed
   let m = patterns[0].exec(html); if(m) return m[1];
   m = patterns[1].exec(html); if(m) return m[1];
-  // 2) data-* attributes
   m = patterns[2].exec(html);
   if(m){
     const s = m[1];
     let em = /embed\/([a-zA-Z0-9_-]{11})/.exec(s) || /[?&]v=([a-zA-Z0-9_-]{11})/.exec(s);
     if(em) return em[1];
   }
-  // 3) JSON "videoId"
   m = patterns[3].exec(html); if(m) return m[1];
-  // 4) meta og:video:url
   m = patterns[4].exec(html);
   if(m){
     const s = m[1];
     let em = /embed\/([a-zA-Z0-9_-]{11})/.exec(s) || /[?&]v=([a-zA-Z0-9_-]{11})/.exec(s);
     if(em) return em[1];
   }
-  // 5) JSON-LD blocks
   let mld;
   while((mld = patterns[5].exec(html))){
     try{
@@ -214,26 +218,22 @@ function pickYouTubeId(html){
       }
     }catch(_){}
   }
-  // 6) srcdoc
   m = patterns[6].exec(html);
   if(m){
     const inner = m[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'");
     let em = /youtube(?:-nocookie)?\.com\/embed\/([a-zA-Z0-9_-]{11})/i.exec(inner) || /[?&]v=([a-zA-Z0-9_-]{11})/i.exec(inner);
     if(em) return em[1];
   }
-  // 7) generic v=
   m = patterns[7].exec(html); if(m) return m[1];
-
   return null;
 }
 
 async function bfsIframeHtmls(baseUrl, html, depth){
-  const toAbs = (u)=>toAbsolute(baseUrl, u);
   const visited = new Set();
   const queue = [];
   const iframes = [...html.matchAll(/<iframe[^>]+src=['"]([^'"]+)['"]/gi)];
   for(const m of iframes){
-    const u = toAbs(m[1]);
+    const u = toAbsolute(baseUrl, m[1]);
     if(!visited.has(u)){ visited.add(u); queue.push({url:u, d:1}); }
   }
   const out = [];
