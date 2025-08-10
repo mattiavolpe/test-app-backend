@@ -1,15 +1,20 @@
-# Tokyo Live Proxy (Minimal Fixed)
+# Tokyo Live Proxy (Fixed for HLS/CORS)
 
-File inclusi:
-- server.js (Express + http-proxy-middleware)
-- package.json (start script)
-- Procfile (web: node server.js) — consigliato per Railway/Heroku style
+Endpoints
+- `/` and `/health` -> return `ok`
+- `/proxy?url=<URL-ENCODED>` -> proxies the given URL with permissive CORS headers
+  Example: `/proxy?url=https%3A%2F%2Ftest-streams.mux.dev%2Fx36xhzz%2Fx36xhzz.m3u8`
 
-Note per Railway:
-1) Crea una repo GitHub con questi file nella root.
-2) Railway → New Project → Deploy from GitHub.
-3) In Settings → Start Command: lascia vuoto (usa Procfile) oppure setta `npm start`.
-4) Quando chiede la porta, indica **3000** (comunque usa process.env.PORT).
-5) Verifica / e /health restituiscano `ok`:
-   https://<tuo-subdominio>.up.railway.app/
-   https://<tuo-subdominio>.up.railway.app/health
+Railway Deploy
+1) Put these files in a GitHub repo (root): server.js, package.json, Procfile.
+2) Railway -> New Project -> Deploy from GitHub -> select repo.
+3) Set Start Command to `npm start` (or leave blank to use Procfile).
+4) When prompted for port, enter **3000** (Railway still injects PORT env).
+5) Verify:
+   - `https://<subdomain>.up.railway.app/health` -> ok
+   - Try the Mux demo through proxy:
+     `https://<subdomain>.up.railway.app/proxy?url=https%3A%2F%2Ftest-streams.mux.dev%2Fx36xhzz%2Fx36xhzz.m3u8`
+
+Use in Vercel frontend
+- Set env var `VITE_PROXY_BASE` = `https://<subdomain>.up.railway.app`
+- Use HLS test button in the app to confirm playback.
