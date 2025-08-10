@@ -1,4 +1,4 @@
-// server.js — HLS proxy + HTTPS + iframe + gethls + getyoutube
+// server.js — HLS proxy + HTTPS + iframe + improved getyoutube (BFS across iframes) + gethls
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const cors = require('cors');
@@ -8,21 +8,20 @@ const app = express();
 app.set('trust proxy', true);
 
 app.use(cors({
-  origin: '*',
-  methods: ['GET','HEAD','OPTIONS'],
+  origin: '*', methods: ['GET','HEAD','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization','Range']
 }));
 app.options('*', cors());
 
-// health
 app.get('/', (_req,res)=>res.status(200).send('ok'));
 app.get('/health', (_req,res)=>res.status(200).send('ok'));
 
-// helpers
+// utils
 function toAbsolute(baseUrl, maybeRelative) {
   try { return new URL(maybeRelative).href; }
   catch {
     const base = new URL(baseUrl);
+    if (maybeRelative.startsWith('//')) return base.protocol + maybeRelative; // protocol-relative
     if (maybeRelative.startsWith('/')) return base.origin + maybeRelative;
     const pathname = base.pathname.endsWith('/') ? base.pathname : base.pathname.substring(0, base.pathname.lastIndexOf('/') + 1);
     return base.origin + pathname + maybeRelative;
@@ -40,7 +39,6 @@ function rewriteManifest(originalUrl, body, proxyBase) {
   return out.join('\n');
 }
 
-// /proxy — HLS with manifest rewriting
 app.use('/proxy', (req, res, next) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('missing url');
@@ -78,7 +76,6 @@ app.use('/proxy', (req, res, next) => {
   })(req,res,next);
 });
 
-// /iframe — best-effort HTML proxy
 app.get('/iframe', async (req,res)=>{
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('missing url');
@@ -95,7 +92,6 @@ app.get('/iframe', async (req,res)=>{
   }catch(e){ console.error('iframe error',e); res.status(502).send('iframe proxy error'); }
 });
 
-// /gethls — extract .m3u8 (follows iframes up to 2 levels)
 app.get('/gethls', async (req,res)=>{
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).json({ error:'missing url' });
@@ -103,19 +99,10 @@ app.get('/gethls', async (req,res)=>{
     const html = await (await fetch(targetUrl, { headers:{ 'User-Agent':'Mozilla/5.0' } })).text();
     let found = extractM3U8(html);
     if(!found){
-      const ifr = findFirstIframeSrc(html);
-      if(ifr){
-        const abs = toAbsolute(targetUrl, ifr);
-        const html2 = await (await fetch(abs, { headers:{ 'User-Agent':'Mozilla/5.0' } })).text();
-        found = extractM3U8(html2, abs);
-        if(!found){
-          const ifr2 = findFirstIframeSrc(html2);
-          if(ifr2){
-            const abs2 = toAbsolute(abs, ifr2);
-            const html3 = await (await fetch(abs2, { headers:{ 'User-Agent':'Mozilla/5.0' } })).text();
-            found = extractM3U8(html3, abs2);
-          }
-        }
+      const htmls = await bfsIframeHtmls(targetUrl, html, 2);
+      for(const h of htmls){
+        found = extractM3U8(h.html);
+        if(found) { break; }
       }
     }
     if(!found) return res.status(404).json({ error:'no m3u8 found' });
@@ -128,27 +115,17 @@ app.get('/gethls', async (req,res)=>{
   }
 });
 
-// /getyoutube — extract YouTube video ID from page (follows iframes up to 2 levels)
 app.get('/getyoutube', async (req,res)=>{
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).json({ error:'missing url' });
   try{
-    const html = await (await fetch(targetUrl, { headers:{ 'User-Agent':'Mozilla/5.0' } })).text();
-    let id = extractYouTubeId(html);
+    const mainHtml = await (await fetch(targetUrl, { headers:{ 'User-Agent':'Mozilla/5.0' } })).text();
+    let id = pickYouTubeId(targetUrl, mainHtml);
     if(!id){
-      const ifr = findFirstIframeSrc(html);
-      if(ifr){
-        const abs = toAbsolute(targetUrl, ifr);
-        const html2 = await (await fetch(abs, { headers:{ 'User-Agent':'Mozilla/5.0' } })).text();
-        id = extractYouTubeId(html2);
-        if(!id){
-          const ifr2 = findFirstIframeSrc(html2);
-          if(ifr2){
-            const abs2 = toAbsolute(abs, ifr2);
-            const html3 = await (await fetch(abs2, { headers:{ 'User-Agent':'Mozilla/5.0' } })).text();
-            id = extractYouTubeId(html3);
-          }
-        }
+      const htmls = await bfsIframeHtmls(targetUrl, mainHtml, 3); // explore broader than before
+      for(const h of htmls){
+        id = pickYouTubeId(h.url, h.html);
+        if(id) break;
       }
     }
     if(!id) return res.status(404).json({ error:'no youtube id found' });
@@ -159,8 +136,8 @@ app.get('/getyoutube', async (req,res)=>{
   }
 });
 
-// helpers
-function extractM3U8(html, base){
+// ---- helpers ----
+function extractM3U8(html){
   const patterns = [
     /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi,
     /['"]([^'"]+\.m3u8[^'"]*)['"]/gi,
@@ -175,23 +152,93 @@ function extractM3U8(html, base){
   }
   return null;
 }
-function findFirstIframeSrc(html){
-  const m = /<iframe[^>]+src=['"]([^'"]+)['"]/i.exec(html);
-  return m ? m[1] : null;
-}
-function extractYouTubeId(html){
-  // common patterns: youtube.com/embed/ID, youtube-nocookie.com/embed/ID, youtu.be/ID, "videoId":"ID"
-  const patterns = [
-    /youtube(?:-nocookie)?\.com\/embed\/([a-zA-Z0-9_-]{11})/i,
-    /youtu\.be\/([a-zA-Z0-9_-]{11})/i,
-    /"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"/i,
-    /"ytInitialPlayerResponse"[^>]*"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"/i
-  ];
-  for(const p of patterns){
-    const m = p.exec(html);
-    if(m) return m[1];
+
+function pickYouTubeId(baseUrl, html){
+  // 1) direct embed urls
+  const embed = /youtube(?:-nocookie)?\.com\/embed\/([a-zA-Z0-9_-]{11})/i.exec(html);
+  if(embed) return embed[1];
+  const shorty = /youtu\.be\/([a-zA-Z0-9_-]{11})/i.exec(html);
+  if(shorty) return shorty[1];
+
+  // 2) videoId in JSON
+  const vid1 = /"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"/i.exec(html);
+  if(vid1) return vid1[1];
+  const vid2 = /'videoId'\s*:\s*'([a-zA-Z0-9_-]{11})'/i.exec(html);
+  if(vid2) return vid2[1];
+
+  // 3) og:video:url or ld+json embedUrl
+  const og = /<meta[^>]+property=["']og:video:url["'][^>]+content=["']([^"']+)["']/i.exec(html);
+  if(og){
+    const m = /embed\/([a-zA-Z0-9_-]{11})/.exec(og[1]); if(m) return m[1];
+    const v = /[?&]v=([a-zA-Z0-9_-]{11})/.exec(og[1]); if(v) return v[1];
   }
+  const ld = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let mld; 
+  while((mld = ld.exec(html))){
+    try{
+      const data = JSON.parse(mld[1]);
+      // handle both object and array
+      const items = Array.isArray(data) ? data : [data];
+      for(const it of items){
+        const emb = it.embedUrl || (it.video && it.video.embedUrl);
+        if(typeof emb === 'string'){
+          const m = /embed\/([a-zA-Z0-9_-]{11})/.exec(emb); if(m) return m[1];
+          const v = /[?&]v=([a-zA-Z0-9_-]{11})/.exec(emb); if(v) return v[1];
+        }
+      }
+    }catch(_){}
+  }
+
+  // 4) generic links with v= param
+  const vq = /(?:youtube\.com\/watch\?[^"'<>]*[?&]v=|[?&]v=)([a-zA-Z0-9_-]{11})/i.exec(html);
+  if(vq) return vq[1];
+
+  // 5) srcdoc content inside iframes
+  const srcdoc = /<iframe[^>]+srcdoc=['"]([\s\S]*?)['"]/i.exec(html);
+  if(srcdoc){
+    const inner = htmlEntityDecode(srcdoc[1]);
+    const em2 = /youtube(?:-nocookie)?\.com\/embed\/([a-zA-Z0-9_-]{11})/i.exec(inner);
+    if(em2) return em2[1];
+    const v2 = /[?&]v=([a-zA-Z0-9_-]{11})/i.exec(inner);
+    if(v2) return v2[1];
+  }
+
   return null;
+}
+
+function htmlEntityDecode(s){
+  return s.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'");
+}
+
+async function bfsIframeHtmls(baseUrl, html, depth){
+  const visited = new Set();
+  const queue = [];
+  // collect ALL iframe srcs, not just the first
+  const iframes = [...html.matchAll(/<iframe[^>]+src=['"]([^'"]+)['"]/gi)];
+  for(const m of iframes){
+    const u = toAbsolute(baseUrl, m[1]);
+    if(!visited.has(u)){ visited.add(u); queue.push({url:u, d:1}); }
+  }
+  const out = [];
+  while(queue.length){
+    const node = queue.shift();
+    try{
+      const r = await fetch(node.url, { headers:{ 'User-Agent':'Mozilla/5.0' } });
+      const h = await r.text();
+      out.push({ url: node.url, html: h });
+      if(node.d < depth){
+        const subs = [...h.matchAll(/<iframe[^>]+src=['"]([^'"]+)['"]/gi)];
+        for(const m of subs){
+          const u2 = toAbsolute(node.url, m[1]);
+          if(!visited.has(u2)){
+            visited.add(u2);
+            queue.push({url:u2, d:node.d+1});
+          }
+        }
+      }
+    }catch(_){}
+  }
+  return out;
 }
 
 const PORT = process.env.PORT || 3000;
